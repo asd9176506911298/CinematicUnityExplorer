@@ -19,10 +19,10 @@ namespace UnityExplorer.UI.Panels
     public class FreeCamPanel : UEPanel
     {
         public enum FreeCameraType {
-            New,
-            Gameplay,
-            Cloned,
             ForcedMatrix,
+            Cloned,
+            Gameplay,
+            New,
         }
 
         public FreeCamPanel(UIBase owner) : base(owner)
@@ -37,7 +37,7 @@ namespace UnityExplorer.UI.Panels
 
         public override string Name => "Freecam";
         public override UIManager.Panels PanelType => UIManager.Panels.Freecam;
-        public override int MinWidth => 450;
+        public override int MinWidth => 500;
         public override int MinHeight => 750;
         public override Vector2 DefaultAnchorMin => new(0.4f, 0.4f);
         public override Vector2 DefaultAnchorMax => new(0.6f, 0.6f);
@@ -68,18 +68,54 @@ namespace UnityExplorer.UI.Panels
 
         static ButtonRef startStopButton;
         public static Dropdown cameraTypeDropdown;
+        internal static Dropdown targetCameraDropdown;
         internal static FreeCameraType currentCameraType;
         public static Toggle blockFreecamMovementToggle;
         public static Toggle blockGamesInputOnFreecamToggle;
         static InputFieldRef positionInput;
         static InputFieldRef moveSpeedInput;
+        static InputFieldRef componentsToDisableInput;
         static Text followLookAtObjectLabel;
         static ButtonRef inspectButton;
         public static Toggle followRotationToggle;
         static bool disabledCinemachine;
         static bool disabledOrthographic;
+        static bool disabledOcclusionCulling;
+        static List<string> stringComponentsToDisable = new();
+        
+        private class DisableTarget
+        {
+            public UnityEngine.Object Target { get; private set; }
+            public bool IsGameObject { get; private set; }
 
-        public static bool supportedInput => InputManager.CurrentType == InputType.Legacy;
+            public DisableTarget(Behaviour component)
+            {
+                Target = component;
+                IsGameObject = false;
+            }
+
+            public DisableTarget(GameObject gameObject)
+            {
+                Target = gameObject;
+                IsGameObject = true;
+            }
+
+            public void SetEnabled(bool enable)
+            {
+                if (IsGameObject)
+                {
+                    ((GameObject)Target).SetActive(enable);
+                }
+                else
+                {
+                    ((Behaviour)Target).enabled = enable;
+                }
+            }
+        }
+
+        static List<DisableTarget> componentsToDisable = new();
+
+        public static bool supportedInput => InputManager.CurrentType == InputType.Legacy || InputManager.CurrentType == InputType.InputSystem;
 
         static InputFieldRef nearClipPlaneInput;
         static Slider nearClipPlaneSlider;
@@ -100,13 +136,14 @@ namespace UnityExplorer.UI.Panels
 
         internal static void BeginFreecam()
         {
-            inFreeCamMode = true;
             connector?.UpdateFreecamStatus(true);
 
             previousMousePosition = IInputManager.MousePosition;
-
             CacheMainCamera();
             SetupFreeCamera();
+
+            // Need to be done after CacheMainCamera to not trigger targetCameraDropdown onValueChanged
+            inFreeCamMode = true;
 
             inspectButton.GameObject.SetActive(true);
 
@@ -116,9 +153,78 @@ namespace UnityExplorer.UI.Panels
             freecamCursorUnlocker.Enable();
         }
 
+        private static Camera[] GetAvailableCameras()
+        {
+            Camera[] cameras = {};
+            try
+            {
+                cameras = Camera.allCameras;
+            }
+            // Some ILCPP games might not have Camera.allCameras available
+            catch {
+                cameras = RuntimeHelper.FindObjectsOfTypeAll<Camera>();
+            }
+
+            return cameras.Where(c => c.name != "CUE Camera").ToArray();
+        }
+
+        private static Camera GetTargetCamera()
+        {
+            if (!ConfigManager.Freecam_Camera_Target_Selection.Value && !targetCameraDropdown)
+            {
+                return Camera.main;
+            }
+
+            Camera[] cameras = GetAvailableCameras();
+
+            int selectedCameraTargetIndex = -1;
+
+            // If the list of camera was updated since the last time we checked, update the dropdown and select the current main camera if available
+            if (!cameras.Select(c => c.name).SequenceEqual(targetCameraDropdown.options.ToArray().Select(c => c.text))) 
+            {
+                targetCameraDropdown.options.Clear();
+                for (int i = 0; i < cameras.Length; i++)
+                {
+                    Camera cam = cameras[i];
+                    targetCameraDropdown.options.Add(new Dropdown.OptionData(cam.name));
+
+                    // The user selected a target camera at some point, default to that
+                    if (ConfigManager.Preferred_Target_Camera.Value == GetGameObjectPath(cam.gameObject)) {
+                        selectedCameraTargetIndex = i;
+                    }
+                }
+
+                // If couldn't find the user selected camera default to the main camera
+                if (selectedCameraTargetIndex == -1)
+                {
+                    for (int i = 0; i < cameras.Length; i++)
+                    {
+                        if (cameras[i] == Camera.main)
+                        {
+                            selectedCameraTargetIndex = i;
+                            break;
+                        }
+                    }
+                }
+
+                SetTargetDropdownValueWithoutNotify(selectedCameraTargetIndex);
+                targetCameraDropdown.captionText.text = cameras[selectedCameraTargetIndex].name;
+            }
+
+            // Fallback to the first camera
+            if (targetCameraDropdown.value >= cameras.Length)
+            {
+                ExplorerCore.LogWarning($"Selected camera index {targetCameraDropdown.value} is out of bounds, resetting to 0.");
+                targetCameraDropdown.value = 0; 
+            }
+
+            return cameras[targetCameraDropdown.value];
+        }
+
         static void CacheMainCamera()
         {
-            Camera currentMain = Camera.main;
+            Camera currentMain = GetTargetCamera();
+
             if (currentMain)
             {
                 lastMainCamera = currentMain;
@@ -153,6 +259,7 @@ namespace UnityExplorer.UI.Panels
                         ourCamera = lastMainCamera;
                         MaybeToggleCinemachine(false);
                         MaybeToggleOrthographic(false);
+                        ToggleCustomComponents(false);
 
                         // If the farClipPlaneValue is the default one try to use the one from the gameplay camera
                         if (farClipPlaneValue == 2000){
@@ -171,7 +278,7 @@ namespace UnityExplorer.UI.Panels
                         lastMainCamera.enabled = false;
                     }
 
-                    ourCamera = new GameObject("UE_Freecam").AddComponent<Camera>();
+                    ourCamera = new GameObject("CUE Camera").AddComponent<Camera>();
                     ourCamera.gameObject.tag = "MainCamera";
                     GameObject.DontDestroyOnLoad(ourCamera.gameObject);
                     ourCamera.gameObject.hideFlags = HideFlags.HideAndDontSave;
@@ -187,8 +294,9 @@ namespace UnityExplorer.UI.Panels
 
                         ourCamera = GameObject.Instantiate(lastMainCamera);
                         lastMainCamera.enabled = false;
-                        MaybeToggleCinemachine(false);
+                        MaybeDeleteCinemachine();
                         MaybeToggleOrthographic(false);
+                        ToggleCustomComponents(false);
 
                         // If the farClipPlaneValue is the default one try to use the one from the gameplay camera
                         if (farClipPlaneValue == 2000){
@@ -212,8 +320,10 @@ namespace UnityExplorer.UI.Panels
                         // so we will try to move the real camera as well.
                         MaybeToggleCinemachine(false);
                         MaybeToggleOrthographic(false);
+                        MaybeToggleOcclusionCulling(false);
+                        ToggleCustomComponents(false);
 
-                        cameraMatrixOverrider = new GameObject("[CUE] Camera Matrix Overrider").AddComponent<Camera>();
+                        cameraMatrixOverrider = new GameObject("CUE Camera").AddComponent<Camera>();
                         cameraMatrixOverrider.enabled = false;
                         cameraMatrixOverrider.transform.position = lastMainCamera.transform.position;
                         cameraMatrixOverrider.transform.rotation = lastMainCamera.transform.rotation;
@@ -228,7 +338,7 @@ namespace UnityExplorer.UI.Panels
             // Fallback in case we couldn't find the main camera for some reason
             if (!ourCamera)
             {
-                ourCamera = new GameObject("UE_Freecam").AddComponent<Camera>();
+                ourCamera = new GameObject("CUE Camera").AddComponent<Camera>();
                 ourCamera.gameObject.tag = "MainCamera";
                 GameObject.DontDestroyOnLoad(ourCamera.gameObject);
                 ourCamera.gameObject.hideFlags = HideFlags.HideAndDontSave;
@@ -240,18 +350,18 @@ namespace UnityExplorer.UI.Panels
             if (!cameraPathMover)
                 cameraPathMover = ourCamera.gameObject.AddComponent<CatmullRom.CatmullRomMover>();
 
+            string currentScene = SceneManager.GetActiveScene().name;
+            if (ConfigManager.Reset_Camera_Transform.Value || lastScene != currentScene){
+                ResetCameraTransform();
+            }
+            lastScene = currentScene;
+
             GetFreecam().transform.position = (Vector3)currentUserCameraPosition;
             GetFreecam().transform.rotation = (Quaternion)currentUserCameraRotation;
             SetFOV(currentUserCameraFov);
 
             ourCamera.gameObject.SetActive(true);
             ourCamera.enabled = true;
-
-            string currentScene = SceneManager.GetActiveScene().name;
-            if (lastScene != currentScene || ConfigManager.Reset_Camera_Transform.Value){
-                OnResetPosButtonClicked();
-            }
-            lastScene = currentScene;
         }
 
         internal static void EndFreecam()
@@ -263,6 +373,7 @@ namespace UnityExplorer.UI.Panels
                 case FreeCameraType.Gameplay:
                     MaybeToggleCinemachine(true);
                     MaybeToggleOrthographic(true);
+                    ToggleCustomComponents(true);
                     ourCamera = null;
 
                     if (lastMainCamera)
@@ -283,6 +394,8 @@ namespace UnityExplorer.UI.Panels
                 case FreeCameraType.ForcedMatrix:
                     MaybeToggleCinemachine(true);
                     MaybeToggleOrthographic(true);
+                    MaybeToggleOcclusionCulling(true);
+                    ToggleCustomComponents(true);
                     MethodInfo resetCullingMatrixMethod = typeof(Camera).GetMethod("ResetCullingMatrix", new Type[] {});
                     resetCullingMatrixMethod.Invoke(ourCamera, null);
 
@@ -321,6 +434,49 @@ namespace UnityExplorer.UI.Panels
             freecamCursorUnlocker.Disable();
         }
 
+        internal static void MaybeResetFreecam()
+        {
+            if (inFreeCamMode) {
+                EndFreecam();
+                BeginFreecam();
+            }
+        }
+
+        internal static void UpdateTargetCameraAction(int newCameraIndex)
+        {
+            Camera[] cameras = GetAvailableCameras();
+            Camera cam = cameras[newCameraIndex];
+            ConfigManager.Preferred_Target_Camera.Value = GetGameObjectPath(cam.gameObject);
+            MaybeResetFreecam();
+        }
+
+        internal static void SetTargetDropdownValueWithoutNotify(int selectedCameraTargetIndex)
+        {
+            // Some build types don't have a reference to Dropdown.SetValueWithoutNotify
+            MethodInfo SetValueWithoutNotifyMethod = targetCameraDropdown.GetType().GetMethod("SetValueWithoutNotify", new[] { typeof(int) });
+            if (SetValueWithoutNotifyMethod != null)
+            {
+                SetValueWithoutNotifyMethod.Invoke(targetCameraDropdown, new object[] { selectedCameraTargetIndex });
+            }
+            else
+            {
+                targetCameraDropdown.onValueChanged.RemoveListener(UpdateTargetCameraAction);
+                targetCameraDropdown.value = selectedCameraTargetIndex;
+                targetCameraDropdown.onValueChanged.AddListener(UpdateTargetCameraAction);
+            }
+        }
+
+        public static string GetGameObjectPath(GameObject obj)
+        {
+            string path = "/" + obj.name;
+            while (obj.transform.parent != null)
+            {
+                obj = obj.transform.parent.gameObject;
+                path = "/" + obj.name + path;
+            }
+            return path;
+        }
+
         // Experimental feature to automatically disable cinemachine when turning on the gameplay freecam.
         // If it causes problems in some games we should consider removing it or making it a toggle.
         // Also, if there are more generic Unity components that control the camera we should include them here.
@@ -344,6 +500,20 @@ namespace UnityExplorer.UI.Panels
             }
         }
 
+        static void MaybeDeleteCinemachine(){
+            if (ourCamera){
+                IEnumerable<Behaviour> comps = ourCamera.GetComponentsInChildren<Behaviour>();
+                foreach (Behaviour comp in comps)
+                {
+                    string comp_type = comp.GetActualType().ToString();
+                    if (comp_type == "Cinemachine.CinemachineBrain" || comp_type == "Il2CppCinemachine.CinemachineBrain"){
+                        GameObject.Destroy(comp);
+                        break;
+                    }
+                }
+            }
+        }
+
         static void MaybeToggleOrthographic(bool enable){
             if (ourCamera) {
                 if (enable) {
@@ -356,6 +526,22 @@ namespace UnityExplorer.UI.Panels
                     if (ourCamera.orthographic) {
                         disabledOrthographic = true;
                         ourCamera.orthographic = false;
+                    }
+                }
+            }
+        }
+
+        static void MaybeToggleOcclusionCulling(bool enable){
+            if (ourCamera) {
+                if (enable) {
+                    if (disabledOcclusionCulling) {
+                        ourCamera.useOcclusionCulling = true;
+                        disabledOcclusionCulling = false;
+                    }
+                } else {
+                    if (ourCamera.useOcclusionCulling) {
+                        disabledOcclusionCulling = true;
+                        ourCamera.useOcclusionCulling = false;
                     }
                 }
             }
@@ -411,14 +597,11 @@ namespace UnityExplorer.UI.Panels
             GameObject CameraModeRow = UIFactory.CreateHorizontalGroup(ContentRoot, "CameraModeRow", false, false, true, true, 3, default, new(1, 1, 1, 0));
 
             Text CameraMode = UIFactory.CreateLabel(CameraModeRow, "Camera Mode", "Camera Mode:");
-            UIFactory.SetLayoutElement(CameraMode.gameObject, minWidth: 100, minHeight: 25);
+            UIFactory.SetLayoutElement(CameraMode.gameObject, minWidth: 75, minHeight: 25);
 
             GameObject cameraTypeDropdownObj = UIFactory.CreateDropdown(CameraModeRow, "CameraType_Dropdown", out cameraTypeDropdown, null, 14, (idx) => {
                 ConfigManager.Default_Freecam.Value = (FreeCameraType)idx;
-                if (inFreeCamMode) {
-                    EndFreecam();
-                    BeginFreecam();
-                }
+                MaybeResetFreecam();
             });
             foreach (FreeCameraType type in Enum.GetValues(typeof(FreeCameraType)).Cast<FreeCameraType>()) {
                 cameraTypeDropdown.options.Add(new Dropdown.OptionData(Enum.GetName(typeof(FreeCameraType), type)));
@@ -426,20 +609,67 @@ namespace UnityExplorer.UI.Panels
             UIFactory.SetLayoutElement(cameraTypeDropdownObj, minHeight: 25, minWidth: 150);
             cameraTypeDropdown.value = (int)ConfigManager.Default_Freecam.Value;
 
-            AddSpacer(5);
+            if (ConfigManager.Freecam_Camera_Target_Selection.Value)
+            {
+                Text TargetCamLabel = UIFactory.CreateLabel(CameraModeRow, "Target_cam_label", " Target cam:");
+                UIFactory.SetLayoutElement(TargetCamLabel.gameObject, minWidth: 75, minHeight: 25);
 
-            GameObject posRow = AddInputField("Position", "Freecam Pos:", "eg. 0 0 0", out positionInput, PositionInput_OnEndEdit);
+                GameObject targetCameraDropdownObj = UIFactory.CreateDropdown(CameraModeRow, "TargetCamera_Dropdown", out targetCameraDropdown, null, 14, null);
+                targetCameraDropdown.onValueChanged.AddListener(UpdateTargetCameraAction);
 
-            ButtonRef resetPosButton = UIFactory.CreateButton(posRow, "ResetButton", "Reset");
+                try {
+                    Camera[] cameras = GetAvailableCameras();
+                    foreach (Camera cam in cameras) {
+                        targetCameraDropdown.options.Add(new Dropdown.OptionData(cam.name));
+                    }
+                    if (Camera.main) {
+                        SetTargetDropdownValueWithoutNotify(Array.IndexOf(cameras, Camera.main));
+                        targetCameraDropdown.captionText.text = Camera.main.name;
+                    }
+                }
+                catch (Exception ex) {
+                    ExplorerCore.LogWarning(ex);
+                }
+
+                UIFactory.SetLayoutElement(targetCameraDropdownObj, minHeight: 25, minWidth: 150);
+            }
+            
+
+            GameObject movespeedRow = AddInputField("MoveSpeed", "Move Speed:", "Default: 1", out moveSpeedInput, MoveSpeedInput_OnEndEdit, 85, 25);
+            moveSpeedInput.Text = desiredMoveSpeed.ToString();
+
+            AddInputField("Position", "Freecam Pos:", "eg. 0 0 0", out positionInput, PositionInput_OnEndEdit, 100, 175, movespeedRow);
+
+            ButtonRef resetPosButton = UIFactory.CreateButton(movespeedRow, "ResetButton", "Reset");
             UIFactory.SetLayoutElement(resetPosButton.GameObject, minWidth: 70, minHeight: 25);
             resetPosButton.OnClick += OnResetPosButtonClicked;
 
-            AddSpacer(5);
+            Text componentsToDisableLabel = UIFactory.CreateLabel(ContentRoot, $"ComponentsToDisable_Label", "Disable Components/GameObjects:");
+            UIFactory.SetLayoutElement(componentsToDisableLabel.gameObject, minWidth: 250, minHeight: 25);
 
-            AddInputField("MoveSpeed", "Move Speed:", "Default: 1", out moveSpeedInput, MoveSpeedInput_OnEndEdit);
-            moveSpeedInput.Text = desiredMoveSpeed.ToString();
+            componentsToDisableInput = UIFactory.CreateInputField(ContentRoot, $"componentsToDisable_Input", "CinemachineBrain");
+            UIFactory.SetLayoutElement(componentsToDisableInput.GameObject, minWidth: 50, minHeight: 25, flexibleWidth: 9999);
+            componentsToDisableInput.Component.GetOnEndEdit().AddListener(ComponentsToDisableInput_OnEndEdit);
+            componentsToDisableInput.Text = ConfigManager.Custom_Components_To_Disable.Value;
+            stringComponentsToDisable = ConfigManager.Custom_Components_To_Disable.Value.Split(',').Select(c => c.Trim()).Where(x => !string.IsNullOrEmpty(x)).ToList();
 
-            AddSpacer(5);
+            GameObject controllerRow = UIFactory.CreateHorizontalGroup(ContentRoot, "ControllerRow", false, false, true, true, 3, default, new(1, 1, 1, 0));
+
+            Text ControllerLabel = UIFactory.CreateLabel(controllerRow, "Controller_label", " Controller:");
+            UIFactory.SetLayoutElement(ControllerLabel.gameObject, minWidth: 75, minHeight: 25);
+
+            if (InputManager.CurrentType == InputType.InputSystem)
+            {
+                GameObject controllerDropdownObj = UIFactory.CreateDropdown(controllerRow, "Controller_Dropdown", out Dropdown controllerDropdown, null, 14, (idx) => {
+                    IGamepadInputInterceptor.SetTargetGamepad(idx);
+                });
+                UIFactory.SetLayoutElement(controllerDropdownObj, minHeight: 25, minWidth: 125);
+                // Maybe we can dynamically show the number of connected gamepads in the future
+                for (int i = 0; i < 4; i++)
+                {
+                    controllerDropdown.options.Add(new Dropdown.OptionData($"Gamepad {i + 1}"));
+                }
+            }
 
             GameObject togglesRow = UIFactory.CreateHorizontalGroup(ContentRoot, "TogglesRow", false, false, true, true, 3, default, new(1, 1, 1, 0));
 
@@ -577,21 +807,21 @@ namespace UnityExplorer.UI.Panels
             UIFactory.SetLayoutElement(obj, minHeight: height, flexibleHeight: 0);
         }
 
-        GameObject AddInputField(string name, string labelText, string placeHolder, out InputFieldRef inputField, Action<string> onInputEndEdit)
+        GameObject AddInputField(string name, string labelText, string placeHolder, out InputFieldRef inputField, Action<string> onInputEndEdit, int minTextWidth = 100, int minInputWidth = 150, GameObject parent = null)
         {
-            GameObject row = UIFactory.CreateHorizontalGroup(ContentRoot, $"{name}_Group", false, false, true, true, 3, default, new(1, 1, 1, 0));
+            GameObject row = parent != null ? parent : UIFactory.CreateHorizontalGroup(ContentRoot, $"{name}_Group", false, false, true, true, 3, default, new(1, 1, 1, 0));
 
             Text posLabel = UIFactory.CreateLabel(row, $"{name}_Label", labelText);
-            UIFactory.SetLayoutElement(posLabel.gameObject, minWidth: 100, minHeight: 25);
+            UIFactory.SetLayoutElement(posLabel.gameObject, minWidth: minTextWidth, minHeight: 25);
 
             inputField = UIFactory.CreateInputField(row, $"{name}_Input", placeHolder);
-            UIFactory.SetLayoutElement(inputField.GameObject, minWidth: 50, minHeight: 25, flexibleWidth: 9999);
+            UIFactory.SetLayoutElement(inputField.GameObject, minWidth: minInputWidth, minHeight: 25, flexibleWidth: 9999);
             inputField.Component.GetOnEndEdit().AddListener(onInputEndEdit);
 
             return row;
         }
 
-        public static void StartStopButton_OnClick()
+        public static void ToggleFreecam()
         {
             EventSystemHelper.SetSelectedGameObject(null);
 
@@ -601,6 +831,11 @@ namespace UnityExplorer.UI.Panels
                 BeginFreecam();
 
             SetToggleButtonState();
+        }
+
+        public static void StartStopButton_OnClick()
+        {
+            ToggleFreecam();
         }
 
         public static void FollowObjectAction(GameObject obj){
@@ -681,19 +916,25 @@ namespace UnityExplorer.UI.Panels
             BeginFreecam();
         }
 
-        static void OnResetPosButtonClicked()
+        static void ResetCameraTransform()
         {
             currentUserCameraPosition = originalCameraPosition;
             currentUserCameraRotation = originalCameraRotation;
+            currentUserCameraFov = originalCameraFOV;
 
-            if (inFreeCamMode && ourCamera)
-            {
-                SetCameraPosition((Vector3)currentUserCameraPosition, true);
-                SetCameraRotation((Quaternion)currentUserCameraRotation, true);
-                ourCamera.fieldOfView = originalCameraFOV;
-            }
+            SetCameraPosition((Vector3)currentUserCameraPosition, true);
+            SetCameraRotation((Quaternion)currentUserCameraRotation, true);
+            ourCamera.fieldOfView = originalCameraFOV;
 
             positionInput.Text = ParseUtility.ToStringForInput<Vector3>(originalCameraPosition);
+        }
+
+        static void OnResetPosButtonClicked()
+        {
+            if (inFreeCamMode && ourCamera)
+            {
+                ResetCameraTransform();
+            }
         }
 
         void PositionInput_OnEndEdit(string input)
@@ -722,6 +963,159 @@ namespace UnityExplorer.UI.Panels
             }
 
             desiredMoveSpeed = parsed;
+        }
+
+        void ComponentsToDisableInput_OnEndEdit(string input)
+        {
+            EventSystemHelper.SetSelectedGameObject(null);
+
+            ConfigManager.Custom_Components_To_Disable.Value = input;
+            stringComponentsToDisable = input.Split(',').Select(c => c.Trim()).Where(x => !string.IsNullOrEmpty(x)).ToList();
+        }
+
+        static List<DisableTarget> GetComponentsToDisable()
+        {
+            List<DisableTarget> components = new();
+            if (stringComponentsToDisable == null || stringComponentsToDisable.Count == 0)
+            {
+                return components;
+            }
+
+            foreach (string stringComponent in stringComponentsToDisable)
+            {
+                List<string> pathToComponent = stringComponent.Split('/').Where(x => !string.IsNullOrEmpty(x)).ToList();
+                GameObject currentGameObject = ourCamera.gameObject;
+                for (var i = 0; i < pathToComponent.Count; i++)
+                {
+                    string pathStep = pathToComponent[i];
+                    if (i == 0 && pathStep == "~")
+                    {
+                        // Check if we can find the next steps game object in the path
+                        i++;
+                        pathStep = pathToComponent[i];
+                        GameObject foundNextPathStep = null;
+                        foreach (GameObject obj in SceneManager.GetActiveScene().GetRootGameObjects()) {
+                            if (obj.name == pathStep)
+                            {
+                                foundNextPathStep = obj;
+                                break;
+                            }
+                        }
+
+                        if (!foundNextPathStep)
+                        {
+                            var test = new GameObject("Test CUE object to get DontDestroyOnLoad scene");
+                            UnityEngine.Object.DontDestroyOnLoad(test);
+                            Scene scene = test.scene;
+                            GameObject.Destroy(test);
+
+                            foreach (GameObject obj in scene.GetRootGameObjects()) {
+                                if (obj.name == pathStep)
+                                {
+                                    foundNextPathStep = obj;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!foundNextPathStep)
+                        {
+                            for (int j = 0; j < SceneManager.sceneCount; j++)
+                            {
+                                Scene scene = SceneManager.GetSceneAt(j);
+                                if (scene == SceneManager.GetActiveScene() || !scene.isLoaded) continue;
+
+                                foreach (GameObject obj in scene.GetRootGameObjects()) {
+                                    if (obj.name == pathStep)
+                                    {
+                                        foundNextPathStep = obj;
+                                        break;
+                                    }
+                                }
+                                if (foundNextPathStep) break;
+                            }
+                        }
+
+                        if (!foundNextPathStep)
+                        {
+                            ExplorerCore.LogWarning($"Couldn't find root {foundNextPathStep} gameobject on {stringComponent} path to disable it.");
+                            break;
+                        }
+                        currentGameObject = foundNextPathStep;
+                        continue;
+                    }
+
+                    if (pathStep == "..") {
+                        if (!currentGameObject.transform.parent)
+                        {
+                            ExplorerCore.LogWarning($"{currentGameObject.name} doesn't have a parent, so can't go up the parent hierarchy on {stringComponent}.");
+                            break;
+                        }
+
+                        currentGameObject = currentGameObject.transform.parent.gameObject;
+                        continue;
+                    }
+
+                    // Last member of the path, could be either a component or a GameObject
+                    if (i == pathToComponent.Count - 1) {
+                        Behaviour comp = GetComponentByName(currentGameObject, pathStep);
+                        if (comp) {
+                            components.Add(new DisableTarget(comp));
+                        }
+                        else {
+                            Transform nextGameObjectTransform = currentGameObject.transform.Find(pathStep);
+                            if (!nextGameObjectTransform) {
+                                ExplorerCore.LogWarning($"Couldn't find {pathStep} component or gameobject on {stringComponent} path to disable it.");
+                                break;
+                            }
+
+                            components.Add(new DisableTarget(nextGameObjectTransform.gameObject));
+                        }
+                    }
+                    else {
+                        Transform nextGameObjectTransform = currentGameObject.transform.Find(pathStep);
+                        if (!nextGameObjectTransform)
+                        {
+                            ExplorerCore.LogWarning($"Couldn't find {pathStep} gameobject on {stringComponent} path to disable it.");
+                            break;
+                        }
+
+                        currentGameObject = nextGameObjectTransform.gameObject;
+                    }
+                }
+            }
+            return components;
+        }
+
+        static void ToggleCustomComponents(bool enable)
+        {
+            // If disable get the components again
+            if (!enable)
+            {
+                componentsToDisable = GetComponentsToDisable();
+            }
+
+            foreach(DisableTarget target in componentsToDisable)
+            {
+                // We could outright delete the components/gameobjects if on Cloned freecam mode
+                target.SetEnabled(enable);
+            }
+        }
+
+        public static Behaviour GetComponentByName(GameObject obj, string componentsName)
+        {
+            if (obj)
+            {
+                IEnumerable<Behaviour> comps = obj.GetComponents<Behaviour>();
+                foreach (Behaviour comp in comps)
+                {
+                    string comp_type = comp.GetActualType().ToString();
+                    if (comp_type == componentsName){
+                        return comp;
+                    }
+                }
+            }
+            return null;
         }
 
         void NearClipInput_OnEndEdit(string input)
@@ -844,8 +1238,15 @@ namespace UnityExplorer.UI.Panels
         public FreeCamBehaviour(IntPtr ptr) : base(ptr) { }
 #endif
         private Action onBeforeRenderAction;
-        private Vector3 cachedPosition;
-        private Quaternion cachedRotation;
+        private CamPaths cachedCamPathsPanel;
+        private bool? hasHDRPComponent = null;
+        private float cachedAspectRatio = -1f;
+        
+        // Cached HDRP reflection objects
+        private Type cachedCameraPositionSettingsType = null;
+        private MethodInfo cachedApplySettingsMethod = null;
+        private FieldInfo cachedPositionField = null;
+        private FieldInfo cachedRotationField = null;
 
         internal void Update()
         {
@@ -856,6 +1257,10 @@ namespace UnityExplorer.UI.Panels
                     FreeCamPanel.EndFreecam();
                     return;
                 }
+
+                if (cachedCamPathsPanel == null)
+                    cachedCamPathsPanel = UIManager.GetPanel<CamPaths>(UIManager.Panels.CamPaths);
+
                 Transform movingTransform = FreeCamPanel.GetFreecam().transform;
 
                 if (!FreeCamPanel.blockFreecamMovementToggle.isOn && !FreeCamPanel.cameraPathMover.playingPath && FreeCamPanel.connector?.IsActive != true && !IsInputFieldInFocus()) {
@@ -884,11 +1289,16 @@ namespace UnityExplorer.UI.Panels
                 }
 
                 UpdateRelativeMatrix();
-                UpdateRealCamera();
+                MaybeUpdateHDRPCameraPositionSettings();
 
                 FreeCamPanel.connector?.ExecuteCameraCommand(FreeCamPanel.GetFreecam());
 
                 FreeCamPanel.UpdatePositionInput();
+                if (FreeCamPanel.cameraMatrixOverrider != null && Mathf.Abs(FreeCamPanel.ourCamera.aspect - cachedAspectRatio) > 0.001f)
+                {
+                    FreeCamPanel.cameraMatrixOverrider.ResetAspect();
+                    cachedAspectRatio = FreeCamPanel.ourCamera.aspect;
+                }
             }
         }
 
@@ -909,25 +1319,25 @@ namespace UnityExplorer.UI.Panels
         private void OnPreCull()
         {
             UpdateRelativeMatrix();
-            UpdateRealCamera();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
         private void OnPreRender()
         {
             UpdateRelativeMatrix();
-            UpdateRealCamera();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
         private void OnCameraPostRender()
         {
             UpdateRelativeMatrix();
-            //RestoreRealCameraTransform();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
         private void LateUpdate()
         {
             UpdateRelativeMatrix();
-            //RestoreRealCameraTransform();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
         internal void UpdateRelativeMatrix() {
@@ -960,12 +1370,37 @@ namespace UnityExplorer.UI.Panels
             FreeCamPanel.currentUserCameraPosition = transform.position;
             FreeCamPanel.currentUserCameraRotation = transform.rotation;
 
+            var leftStickX = IGamepadInputInterceptor.GetAxisValue("/gamepad/leftstick/x");
+            var leftStickY = IGamepadInputInterceptor.GetAxisValue("/gamepad/leftstick/y");
+            var rightStickX = IGamepadInputInterceptor.GetAxisValue("/gamepad/rightstick/x");
+            var rightStickY = IGamepadInputInterceptor.GetAxisValue("/gamepad/rightstick/y");
+            float leftTrigger = IGamepadInputInterceptor.GetAxisValue("/gamepad/lefttrigger");
+            float rightTrigger = IGamepadInputInterceptor.GetAxisValue("/gamepad/righttrigger");
+            bool yButtonPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/buttonnorth");
+            bool xButtonPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/buttonwest");
+            bool bButtonPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/buttoneast");
+            bool dpadUpPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/dpad/up");
+            bool dpadDownPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/dpad/down");
+            bool dpadLeftPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/dpad/left");
+            bool dpadRightPressed = IGamepadInputInterceptor.IsButtonPressed("/gamepad/dpad/right");
+
+            bool leftStickButton = IGamepadInputInterceptor.IsButtonPressed("/gamepad/leftstickpress");
+            bool rightStickButton = IGamepadInputInterceptor.IsButtonPressed("/gamepad/rightstickpress");
+
+            bool aButtonPressedThisFrame = IGamepadInputInterceptor.WasButtonPressedThisFrame("/gamepad/buttonsouth");
+            bool leftShoulderPressed = IGamepadInputInterceptor.WasButtonPressedThisFrame("/gamepad/leftshoulder");
+            bool rightShoulderPressed = IGamepadInputInterceptor.WasButtonPressedThisFrame("/gamepad/rightshoulder");
+
+            bool startButtonPressed = IGamepadInputInterceptor.WasButtonPressedThisFrame("/gamepad/start");
+            bool selectButtonPressed = IGamepadInputInterceptor.WasButtonPressedThisFrame("/gamepad/select");
+
+
             float moveSpeed = FreeCamPanel.desiredMoveSpeed * 0.01665f; //"0.01665f" (60fps) in place of Time.DeltaTime. DeltaTime causes issues when game is paused.
             float speedModifier = 1;
-            if (IInputManager.GetKey(ConfigManager.Speed_Up_Movement.Value))
+            if (IInputManager.GetKey(ConfigManager.Speed_Up_Movement.Value) || yButtonPressed)
                 speedModifier = 10f;
 
-            if (IInputManager.GetKey(ConfigManager.Speed_Down_Movement.Value))
+            if (IInputManager.GetKey(ConfigManager.Speed_Down_Movement.Value) || xButtonPressed)
                 speedModifier = 0.1f;
 
             moveSpeed *= speedModifier;
@@ -988,13 +1423,43 @@ namespace UnityExplorer.UI.Panels
             if (IInputManager.GetKey(ConfigManager.Down.Value))
                 transform.position += transform.up * -1 * moveSpeed;
 
-            if (IInputManager.GetKey(ConfigManager.Tilt_Left.Value))
-                transform.Rotate(0, 0, moveSpeed * 10, Space.Self);
+            if (leftStickX != 0 || leftStickY != 0)
+            {
+                transform.position += transform.right * leftStickX * moveSpeed;
+                transform.position += transform.forward * leftStickY * moveSpeed;
+            }
 
-            if (IInputManager.GetKey(ConfigManager.Tilt_Right.Value))
-                transform.Rotate(0, 0, - moveSpeed * 10, Space.Self);
+            if (leftTrigger > 0)
+            {
+                transform.position += transform.up * leftTrigger * moveSpeed;
+            }
 
-            if (IInputManager.GetKey(ConfigManager.Tilt_Reset.Value)){
+            if (rightTrigger > 0)
+            {
+                transform.position += transform.up * -rightTrigger * moveSpeed;
+            }
+
+            // 90 degrees tilt when pressing the speed down hotkey
+            if (IInputManager.GetKey(ConfigManager.Speed_Down_Movement.Value))
+            {
+                if (IInputManager.GetKeyDown(ConfigManager.Tilt_Left.Value)) {
+                    transform.Rotate(0, 0, 90, Space.Self);
+                }
+                else if (IInputManager.GetKeyDown(ConfigManager.Tilt_Right.Value)) {
+                    transform.Rotate(0, 0, - 90, Space.Self);
+                }
+            }
+            else
+            {
+                if (IInputManager.GetKey(ConfigManager.Tilt_Left.Value) || dpadLeftPressed) {
+                    transform.Rotate(0, 0, moveSpeed * 10, Space.Self);
+                }
+                else if (IInputManager.GetKey(ConfigManager.Tilt_Right.Value) || dpadRightPressed) {
+                    transform.Rotate(0, 0, - moveSpeed * 10, Space.Self);
+                }
+            }
+
+            if (IInputManager.GetKey(ConfigManager.Tilt_Reset.Value) || (leftStickButton && bButtonPressed)){
                 // Extract the forward direction of the original quaternion
                 Vector3 forwardDirection = transform.rotation * Vector3.forward;
                 // Reset the tilt by creating a new quaternion with no tilt
@@ -1007,8 +1472,11 @@ namespace UnityExplorer.UI.Panels
             {
                 Vector3 mouseDelta = IInputManager.MousePosition - FreeCamPanel.previousMousePosition;
                 
-                float newRotationX = transform.localEulerAngles.y + mouseDelta.x * 0.3f;
-                float newRotationY = transform.localEulerAngles.x - mouseDelta.y * 0.3f;
+                // Scale rotation speed based on FOV, 60 as a baseline
+                float fovMultiplier = FreeCamPanel.GetFreecam().fieldOfView / 60.0f;
+                float rotationSensitivity = 0.3f * fovMultiplier;
+                float newRotationX = transform.localEulerAngles.y + mouseDelta.x * rotationSensitivity;
+                float newRotationY = transform.localEulerAngles.x - mouseDelta.y * rotationSensitivity;
 
                 // Block the camera rotation to not go further than looking directly up or down.
                 // We give a little extra to the [0, 90] rotation segment to not get the camera rotation stuck.
@@ -1033,18 +1501,84 @@ namespace UnityExplorer.UI.Panels
                 transform.rotation = pitchRotation * yawRotation * transform.rotation;*/
             }
 
-            if (IInputManager.GetKey(ConfigManager.Decrease_FOV.Value))
+            if (rightStickX != 0 || rightStickY != 0)
             {
-                FreeCamPanel.GetFreecam().fieldOfView -= moveSpeed; 
+                // Scale rotation speed based on FOV, 60 as a baseline
+                float fovMultiplier = FreeCamPanel.GetFreecam().fieldOfView / 60.0f;
+                float rotationSpeed = moveSpeed * 30 * fovMultiplier;
+                float newRotationX = transform.localEulerAngles.y + rightStickX * rotationSpeed;
+                float newRotationY = transform.localEulerAngles.x - rightStickY * rotationSpeed;
+
+                // Block the camera rotation to not go further than looking directly up or down.
+                newRotationY = newRotationY > 180f ? Mathf.Clamp(newRotationY, 270f, 360f) : Mathf.Clamp(newRotationY, -1f, 90.0f);
+
+                transform.localEulerAngles = new Vector3(newRotationY, newRotationX, transform.localEulerAngles.z);
             }
 
-            if (IInputManager.GetKey(ConfigManager.Increase_FOV.Value))
+            if (IInputManager.GetKey(ConfigManager.Decrease_FOV.Value) || dpadUpPressed)
             {
-                FreeCamPanel.GetFreecam().fieldOfView += moveSpeed; 
+                FreeCamPanel.GetFreecam().fieldOfView = Mathf.Max(FreeCamPanel.GetFreecam().fieldOfView - moveSpeed * 3, 0.001f);
             }
 
-            if (IInputManager.GetKey(ConfigManager.Reset_FOV.Value)){
+            if (IInputManager.GetKey(ConfigManager.Increase_FOV.Value) || dpadDownPressed)
+            {
+                FreeCamPanel.GetFreecam().fieldOfView += moveSpeed * 3; 
+            }
+
+            if (IInputManager.GetKey(ConfigManager.Reset_FOV.Value) || (bButtonPressed && !leftStickButton)){
                 FreeCamPanel.GetFreecam().fieldOfView = FreeCamPanel.currentCameraType == FreeCamPanel.FreeCameraType.New ? 60 : FreeCamPanel.originalCameraFOV;
+            }
+
+            // Time scale gamepad controls
+            if (xButtonPressed)
+            {
+                if (leftShoulderPressed)
+                {
+                    UIManager.GetTimeScaleWidget().DecreaseTimeScale();
+                }
+                else if (rightShoulderPressed)
+                {
+                    UIManager.GetTimeScaleWidget().IncreaseTimeScale();
+                }
+            }
+
+            // Camera path gamepad controls
+            if (cachedCamPathsPanel != null)
+            {
+                if (aButtonPressedThisFrame)
+                {
+                    cachedCamPathsPanel.AddNode();
+                }
+
+                if (leftShoulderPressed)
+                {
+                    cachedCamPathsPanel.NavigateToPreviousNode();
+                }
+
+                if (rightShoulderPressed)
+                {
+                    cachedCamPathsPanel.NavigateToNextNode();
+                }
+                
+                if (startButtonPressed)
+                {
+                    if (FreeCamPanel.cameraPathMover.playingPath)
+                    {
+                        cachedCamPathsPanel.StopPath();
+                    }
+                    else
+                    {
+                        cachedCamPathsPanel.StartPath();
+                    }
+                }
+
+                if (selectButtonPressed)
+                {
+                    if (FreeCamPanel.cameraPathMover.playingPath)
+                    {
+                        cachedCamPathsPanel.TogglePause();
+                    }
+                }
             }
 
             FreeCamPanel.previousMousePosition = IInputManager.MousePosition;
@@ -1053,7 +1587,7 @@ namespace UnityExplorer.UI.Panels
         // The following code forces the freecamcam to update before rendering a frame
         protected virtual void Awake()
         {
-            onBeforeRenderAction = () => { UpdateRelativeMatrix(); UpdateRealCamera(); };
+            onBeforeRenderAction = () => { UpdateRelativeMatrix(); MaybeUpdateHDRPCameraPositionSettings();};
         }
 
         protected virtual void OnEnable()
@@ -1068,41 +1602,66 @@ namespace UnityExplorer.UI.Panels
                 ExplorerCore.LogWarning($"Failed to listen to BeforeRender: {exception}");
             }
 #endif
+
             // These doesn't exist for Unity <2017 nor when using HDRP
             Type renderPipelineManagerType = ReflectionUtility.GetTypeByName("RenderPipelineManager");
             if (renderPipelineManagerType != null){
-                EventInfo beginFrameRenderingEvent = renderPipelineManagerType.GetEvent("beginFrameRendering");
-                if (beginFrameRenderingEvent != null) {
-                    beginFrameRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                try {
+                    EventInfo beginFrameRenderingEvent = renderPipelineManagerType.GetEvent("beginFrameRendering");
+                    if (beginFrameRenderingEvent != null) {
+                        beginFrameRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                    }
                 }
-                EventInfo endFrameRenderingEvent = renderPipelineManagerType.GetEvent("endFrameRendering");
-                if (endFrameRenderingEvent != null) {
-                    endFrameRenderingEvent.AddEventHandler(null, OnAfterEvent);
-                }
+                catch { }
 
-                EventInfo beginCameraRenderingEvent = renderPipelineManagerType.GetEvent("beginCameraRendering");
-                if (beginCameraRenderingEvent != null) {
-                    beginCameraRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                try {
+                    EventInfo endFrameRenderingEvent = renderPipelineManagerType.GetEvent("endFrameRendering");
+                    if (endFrameRenderingEvent != null) {
+                        endFrameRenderingEvent.AddEventHandler(null, OnAfterEvent);
+                    }
                 }
-                EventInfo endCameraRenderingEvent = renderPipelineManagerType.GetEvent("endCameraRendering");
-                if (endCameraRenderingEvent != null) {
-                    endCameraRenderingEvent.AddEventHandler(null, OnAfterEvent);
-                }
+                catch { }
 
-                EventInfo beginContextRenderingEvent = renderPipelineManagerType.GetEvent("beginContextRendering");
-                if (beginContextRenderingEvent != null) {
-                    beginContextRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                try {
+                    EventInfo beginCameraRenderingEvent = renderPipelineManagerType.GetEvent("beginCameraRendering");
+                    if (beginCameraRenderingEvent != null) {
+                        beginCameraRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                    }
                 }
-                EventInfo endContextRenderingEvent = renderPipelineManagerType.GetEvent("endContextRendering");
-                if (endContextRenderingEvent != null) {
-                    endContextRenderingEvent.AddEventHandler(null, OnAfterEvent);
+                catch { }
+
+                try {
+                    EventInfo endCameraRenderingEvent = renderPipelineManagerType.GetEvent("endCameraRendering");
+                    if (endCameraRenderingEvent != null) {
+                        endCameraRenderingEvent.AddEventHandler(null, OnAfterEvent);
+                    }
                 }
+                catch { }
+
+                try {
+                    EventInfo beginContextRenderingEvent = renderPipelineManagerType.GetEvent("beginContextRendering");
+                    if (beginContextRenderingEvent != null) {
+                        beginContextRenderingEvent.AddEventHandler(null, OnBeforeEvent);
+                    }
+                }
+                catch { }
+
+                try {
+                    EventInfo endContextRenderingEvent = renderPipelineManagerType.GetEvent("endContextRendering");
+                    if (endContextRenderingEvent != null) {
+                        endContextRenderingEvent.AddEventHandler(null, OnAfterEvent);
+                    }
+                }
+                catch { }
             }
 
-            EventInfo onBeforeRenderEvent = typeof(Application).GetEvent("onBeforeRender");
-            if (onBeforeRenderEvent != null) {
-                onBeforeRenderEvent.AddEventHandler(null, onBeforeRenderAction);
+            try {
+                EventInfo onBeforeRenderEvent = typeof(Application).GetEvent("onBeforeRender");
+                if (onBeforeRenderEvent != null) {
+                    onBeforeRenderEvent.AddEventHandler(null, onBeforeRenderAction);
+                }
             }
+            catch { }
         }
 
         protected virtual void OnDisable()
@@ -1117,36 +1676,57 @@ namespace UnityExplorer.UI.Panels
                 ExplorerCore.LogWarning($"Failed to unlisten from BeforeRender: {exception}");
             }
 #endif
+
             // These doesn't exist for Unity <2017 nor when using HDRP
             Type renderPipelineManagerType = ReflectionUtility.GetTypeByName("RenderPipelineManager");
-
             if (renderPipelineManagerType != null){
-                EventInfo beginFrameRenderingEvent = renderPipelineManagerType.GetEvent("beginFrameRendering");
-                if (beginFrameRenderingEvent != null) {
-                    beginFrameRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                try {
+                    EventInfo beginFrameRenderingEvent = renderPipelineManagerType.GetEvent("beginFrameRendering");
+                    if (beginFrameRenderingEvent != null) {
+                        beginFrameRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                    }
                 }
-                EventInfo endFrameRenderingEvent = renderPipelineManagerType.GetEvent("endFrameRendering");
-                if (endFrameRenderingEvent != null) {
-                    endFrameRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                catch { }
+                
+                try {
+                    EventInfo endFrameRenderingEvent = renderPipelineManagerType.GetEvent("endFrameRendering");
+                    if (endFrameRenderingEvent != null) {
+                        endFrameRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                    }
                 }
-
-                EventInfo beginCameraRenderingEvent = renderPipelineManagerType.GetEvent("beginCameraRendering");
-                if (beginCameraRenderingEvent != null) {
-                    beginCameraRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                catch { }
+                
+                try {
+                    EventInfo beginCameraRenderingEvent = renderPipelineManagerType.GetEvent("beginCameraRendering");
+                    if (beginCameraRenderingEvent != null) {
+                        beginCameraRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                    }
                 }
-                EventInfo endCameraRenderingEvent = renderPipelineManagerType.GetEvent("endCameraRendering");
-                if (endCameraRenderingEvent != null) {
-                    endCameraRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                catch { }
+                
+                try {
+                    EventInfo endCameraRenderingEvent = renderPipelineManagerType.GetEvent("endCameraRendering");
+                    if (endCameraRenderingEvent != null) {
+                        endCameraRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                    }
                 }
-
-                EventInfo beginContextRenderingEvent = renderPipelineManagerType.GetEvent("beginContextRendering");
-                if (beginContextRenderingEvent != null) {
-                    beginContextRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                catch { }
+                
+                try {
+                    EventInfo beginContextRenderingEvent = renderPipelineManagerType.GetEvent("beginContextRendering");
+                    if (beginContextRenderingEvent != null) {
+                        beginContextRenderingEvent.RemoveEventHandler(null, OnBeforeEvent);
+                    }
                 }
-                EventInfo endContextRenderingEvent = renderPipelineManagerType.GetEvent("endContextRendering");
-                if (endContextRenderingEvent != null) {
-                    endContextRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                catch { }
+                
+                try {
+                    EventInfo endContextRenderingEvent = renderPipelineManagerType.GetEvent("endContextRendering");
+                    if (endContextRenderingEvent != null) {
+                        endContextRenderingEvent.RemoveEventHandler(null, OnAfterEvent);
+                    }
                 }
+                catch { }
             }
 
             EventInfo onBeforeRenderEvent = typeof(Application).GetEvent("onBeforeRender");
@@ -1158,32 +1738,65 @@ namespace UnityExplorer.UI.Panels
         private void OnBeforeEvent(object arg1, Camera[] arg2)
         {
             UpdateRelativeMatrix();
-            UpdateRealCamera();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
         private void OnAfterEvent(object arg1, Camera[] arg2)
         {
             UpdateRelativeMatrix();
-            //RestoreRealCameraTransform();
+            MaybeUpdateHDRPCameraPositionSettings();
         }
 
-        // HDRP matrix override ignores us moving the camera unfortunately, so we try to copy over the position of the camera matrix overrider.
-        protected void UpdateRealCamera() {
-            if (FreeCamPanel.cameraMatrixOverrider != null) {
-                cachedPosition = FreeCamPanel.ourCamera.transform.position;
-                FreeCamPanel.ourCamera.transform.position = FreeCamPanel.cameraMatrixOverrider.transform.position;
-                // We also try to update the rotation in case there are game shaders that use the real camera rotation
-                cachedRotation = FreeCamPanel.ourCamera.transform.rotation;
-                FreeCamPanel.ourCamera.transform.rotation = FreeCamPanel.cameraMatrixOverrider.transform.rotation;
+        internal void MaybeUpdateHDRPCameraPositionSettings()
+        {
+            if (!hasHDRPComponent.HasValue)
+            {
+                hasHDRPComponent = false;
+                
+                Type cameraSettingsUtilitiesType = ReflectionUtility.GetTypeByName("UnityEngine.Rendering.HighDefinition.CameraSettingsUtilities");
+                if (cameraSettingsUtilitiesType == null)
+                    return;
+                
+                cachedCameraPositionSettingsType = ReflectionUtility.GetTypeByName("UnityEngine.Rendering.HighDefinition.CameraPositionSettings");
+                if (cachedCameraPositionSettingsType == null)
+                    return;
+                
+                cachedApplySettingsMethod = cameraSettingsUtilitiesType.GetMethod("ApplySettings", BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(Camera), cachedCameraPositionSettingsType }, null);
+                if (cachedApplySettingsMethod == null)
+                    return;
+                
+                cachedPositionField = cachedCameraPositionSettingsType.GetField("position", BindingFlags.Public | BindingFlags.Instance);
+                cachedRotationField = cachedCameraPositionSettingsType.GetField("rotation", BindingFlags.Public | BindingFlags.Instance);
+                
+                if (cachedPositionField != null && cachedRotationField != null)
+                {
+                    hasHDRPComponent = true;
+                }
+            }
+
+            if (hasHDRPComponent == true)
+            {
+                UpdateHDRPCameraPositionSettings();
             }
         }
 
-        protected void RestoreRealCameraTransform() {
-            if (FreeCamPanel.cameraMatrixOverrider != null) {
-                FreeCamPanel.ourCamera.transform.position = cachedPosition;
-                FreeCamPanel.ourCamera.transform.rotation = cachedRotation;
+        // HDRP handles position and rotation internally, so we need to replace these within HDRP systems
+        internal void UpdateHDRPCameraPositionSettings()
+        {
+            try
+            {
+                object cameraPositionSettings = Activator.CreateInstance(cachedCameraPositionSettingsType);
+
+                cachedPositionField.SetValue(cameraPositionSettings, FreeCamPanel.cameraMatrixOverrider.transform.position);
+                cachedRotationField.SetValue(cameraPositionSettings, FreeCamPanel.cameraMatrixOverrider.transform.rotation);
+
+                cachedApplySettingsMethod.Invoke(null, new object[] { FreeCamPanel.ourCamera, cameraPositionSettings });
             }
-            UpdateRealCamera();
+            catch (Exception ex)
+            {
+                ExplorerCore.LogWarning($"Failed to apply HDRP camera position settings: {ex.Message}\n{ex.StackTrace}");
+                hasHDRPComponent = false;
+            }
         }
     }
 

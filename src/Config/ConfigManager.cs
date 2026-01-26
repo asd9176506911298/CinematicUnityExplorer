@@ -32,8 +32,8 @@ namespace UnityExplorer.Config
         public static ConfigElement<bool> Reflection_Hide_NativeInfoPtrs;
         public static ConfigElement<bool> Auto_Scale_UI;
         public static ConfigElement<bool> Reset_Camera_Transform;
-        public static ConfigElement<float> CamPath_Arrow_Size;
-        public static ConfigElement<float> Light_Arrow_Size;
+        public static ConfigElement<float> Arrow_Size;
+        public static ConfigElement<bool> Freecam_Camera_Target_Selection;
 
         public static ConfigElement<KeyCode> Pause;
         public static ConfigElement<KeyCode> Frameskip;
@@ -63,6 +63,8 @@ namespace UnityExplorer.Config
         public static ConfigElement<KeyCode> Toggle_Animations;
 
         public static ConfigElement<FreeCamPanel.FreeCameraType> Default_Freecam;
+        public static ConfigElement<string> Custom_Components_To_Disable;
+        public static ConfigElement<string> Preferred_Target_Camera;
 
         // internal configs
         internal static InternalConfigHandler InternalHandler { get; private set; }
@@ -192,6 +194,14 @@ namespace UnityExplorer.Config
 
             Reset_Camera_Transform = new("Reset Camera transform on freecam disable",
                 "Reset the camera position and rotation between freecam sessions, so the freecam always starts from the gameplay position and rotation.",
+                true);
+            
+            Arrow_Size = new("Visualizers arrows size",
+                "Cam Paths nodes and Lights Manager lights visualizers' arrow size (must be positive) (needs visualizer toggled to reflect changes).",
+                1f);
+
+            Freecam_Camera_Target_Selection = new("Freecam Camera Target Selection",
+                "Enables certain advanced settings on the Freecam panel, in case the user can't get the freecam to work properly (requires game reset).",
                 false);
 
             Pause = new("Pause",
@@ -302,15 +312,16 @@ namespace UnityExplorer.Config
 
             Default_Freecam = new("Default Freecam mode",
                 "Default type of freecam selected on startup (gets automatically updated with the last type of camera used).",
-                FreeCamPanel.FreeCameraType.New);
+                FreeCamPanel.FreeCameraType.ForcedMatrix);
 
-            CamPath_Arrow_Size = new("Cam Paths Arrow Size",
-                "Cam Paths Visualize Path's Arrow Size",
-                1f);
+            Custom_Components_To_Disable = new("Custom components to disable",
+                "List of custom components to disable when enabling the freecam (gets automatically updated when editing it from the freecam panel).",
+                "");
 
-            Light_Arrow_Size = new("LightsManager Arrow Size",
-                "LightsManager Toggle Visualizer's Arrow Size",
-                1f);
+            Preferred_Target_Camera = new("Preferred Target Camera",
+                "The camera that will be targeted by the freecam methods.\n" +
+                "Only used when Freecam Camera Target Selection is enabled.",
+                "\\");
         }
     }
 }
