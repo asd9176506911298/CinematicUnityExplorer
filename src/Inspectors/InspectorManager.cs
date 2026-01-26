@@ -100,6 +100,9 @@ namespace UnityExplorer
 
         public static void InspectWithFilters(object target, string filterInputField, UnityExplorer.Inspectors.MemberFilter memberFilterFlags = UnityExplorer.Inspectors.MemberFilter.All, bool staticReflection = false, CacheObjectBase parent = null)
         {
+            if (TryFocusActiveInspector(target))
+                return;
+
             ReflectionInspector inspector = CreateInspector<ReflectionInspector>(target, staticReflection, parent);
             inspector.filterInputField.Text = filterInputField;
             //TODO: Update the member flags visually on the inspector.
