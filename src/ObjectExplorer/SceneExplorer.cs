@@ -44,7 +44,7 @@ namespace UnityExplorer.ObjectExplorer
 
         public void Update()
         {
-            if ((AutoUpdate || !SceneHandler.InspectingAssetScene) && timeOfLastUpdate.OccuredEarlierThan(1))
+            if (timeOfLastUpdate.OccuredEarlierThan(1))
             {
                 timeOfLastUpdate = Time.realtimeSinceStartup;
                 UpdateTree();
@@ -86,7 +86,11 @@ namespace UnityExplorer.ObjectExplorer
             if (value < 0 || SceneHandler.LoadedScenes.Count <= value)
                 return;
 
-            SceneHandler.SelectedScene = SceneHandler.LoadedScenes[value];
+            // Use ForceSetSelectedScene here instead of the SelectedScene property setter,
+            // since Unity 6's Scene equality comparison can otherwise cause the setter's
+            // short-circuit check to incorrectly treat a fresh user selection as unchanged.
+            Scene target = SceneHandler.LoadedScenes[value];
+            SceneHandler.ForceSetSelectedScene(target);
             SceneHandler.Update();
             Tree.RefreshData(true, true, true, false);
             OnSelectedSceneChanged(SceneHandler.SelectedScene.Value);
@@ -141,6 +145,12 @@ namespace UnityExplorer.ObjectExplorer
                 Dropdown.OptionData option = new(name);
                 sceneDropdown.options.Add(option);
                 sceneToDropdownOption.Add(scene, option);
+            }
+
+            if (SceneHandler.SelectedScene.HasValue
+                && sceneToDropdownOption.TryGetValue(SceneHandler.SelectedScene.Value, out Dropdown.OptionData currentOption))
+            {
+                sceneDropdown.captionText.text = currentOption.text;
             }
         }
 

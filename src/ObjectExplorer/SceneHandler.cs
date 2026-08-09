@@ -18,6 +18,17 @@ namespace UnityExplorer.ObjectExplorer
         }
         private static Scene? selectedScene;
 
+        /// <summary>Whether the currently selected scene is a placeholder deliberately chosen by the user (DontDestroyOnLoad / HideAndDontSave).</summary>
+        private static bool selectedIsPlaceholder;
+
+        /// <summary>Forces SelectedScene to be set and triggers the event, bypassing the equality check (used for manual user selection).</summary>
+        internal static void ForceSetSelectedScene(Scene value)
+        {
+            selectedScene = value;
+            selectedIsPlaceholder = !value.IsValid();  // Placeholder scenes are designed to be invalid by default.
+            OnInspectedSceneChanged?.Invoke(value);
+        }
+
         /// <summary>The GameObjects in the currently inspected scene.</summary>
         public static IEnumerable<GameObject> CurrentRootObjects { get; private set; } = new GameObject[0];
 
@@ -38,7 +49,7 @@ namespace UnityExplorer.ObjectExplorer
         internal static int DefaultSceneCount => 1 + (DontDestroyExists ? 1 : 0);
 
         /// <summary>Whether or not we are currently inspecting the "HideAndDontSave" asset scene.</summary>
-        public static bool InspectingAssetScene => SelectedScene.HasValue && SelectedScene.Value.handle == -1;
+        public static bool InspectingAssetScene => SelectedScene.HasValue && !SelectedScene.Value.IsValid();
 
         /// <summary>Whether or not we successfuly retrieved the names of the scenes in the build settings.</summary>
         public static bool WasAbleToGetScenesInBuild { get; private set; }
@@ -86,13 +97,44 @@ namespace UnityExplorer.ObjectExplorer
             }
         }
 
+        /// <summary>Constructs a special placeholder Scene with a specified handle value via reflection (used for DontDestroyOnLoad / HideAndDontSave options).</summary>
+        private static Scene CreatePlaceholderScene(int handleValue)
+        {
+            Scene scene = default;
+
+            FieldInfo handleField = typeof(Scene).GetField("m_Handle", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (handleField == null)
+                return scene;
+
+            object boxedScene = scene;
+
+            if (handleField.FieldType == typeof(int))
+            {
+                handleField.SetValue(boxedScene, handleValue);
+            }
+            else
+            {
+                // Unity 6: The m_Handle type is a SceneHandle struct, which internally wraps an int field.
+                object handleStructInstance = Activator.CreateInstance(handleField.FieldType);
+                FieldInfo innerField = handleField.FieldType.GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+                    .FirstOrDefault(f => f.FieldType == typeof(int));
+                if (innerField != null)
+                {
+                    object boxedHandle = handleStructInstance;
+                    innerField.SetValue(boxedHandle, handleValue);
+                    handleField.SetValue(boxedScene, boxedHandle);
+                }
+            }
+
+            return (Scene)boxedScene;
+        }
+
         internal static void Update()
         {
             // Inspected scene will exist if it's DontDestroyOnLoad or HideAndDontSave
             bool inspectedExists =
-                SelectedScene.HasValue
-                && ((DontDestroyExists && SelectedScene.Value.name == "DontDestroyOnLoad")
-                || !SelectedScene.Value.IsValid());
+                 SelectedScene.HasValue
+                 && selectedIsPlaceholder;
 
             LoadedScenes.Clear();
 
@@ -109,13 +151,16 @@ namespace UnityExplorer.ObjectExplorer
                 LoadedScenes.Add(scene);
             }
 
-            //if (DontDestroyExists)
-            //    LoadedScenes.Add(new Scene { m_Handle = -12 });
-            //LoadedScenes.Add(new Scene { m_Handle = -1 });
+            if (DontDestroyExists)
+                LoadedScenes.Add(CreatePlaceholderScene(-12));
+            LoadedScenes.Add(CreatePlaceholderScene(-1));
 
             // Default to first scene if none selected or previous selection no longer exists.
+
             if (!inspectedExists)
-                SelectedScene = LoadedScenes.First();
+            {
+                ForceSetSelectedScene(LoadedScenes.First());
+            }
 
             // Notify on the list changing at all
             OnLoadedScenesUpdated?.Invoke(LoadedScenes);
