@@ -1,5 +1,9 @@
-# Cinematic Unity Explorer
+# Cinematic Unity Explorer (Big Walk Support)
 
+This is a fork of [CinematicUnityExplorer (PR #130)](https://github.com/originalnicodr/CinematicUnityExplorer/pull/130), updated and fixed specifically to work with **Big Walk**.
+
+* 🛠️ **Main Mod**: [asd9176506911298/CinematicUnityExplorer (BigWalk Branch)](https://github.com/asd9176506911298/CinematicUnityExplorer/tree/BigWalk)
+* 📦 **Dependency**: [asd9176506911298/UniverseLib (BigWalk Branch)](https://github.com/asd9176506911298/UniverseLib/tree/BigWalk)
 <p align="center">
   <img align="center" src="img/icon.png" width="300" height="300">
 </p>
